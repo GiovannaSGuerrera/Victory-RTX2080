@@ -33,6 +33,20 @@ pub(crate) fn full_pass() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_FULL").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_HEAP_PASS_NO_SELF_MARK=1` skips marks made by the pass itself,
+/// while retrying views without host copies every pass (as with self-marks).
+/// External writes, record comparisons and periodic full passes stay active.
+pub(crate) fn no_self_mark() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HEAP_PASS_NO_SELF_MARK").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("buffer pass skips self-marks and retries orphan views every pass (VICTORY_HEAP_PASS_NO_SELF_MARK=1)");
+        }
+        on
+    })
+}
+
 /// A slot's record in title memory: the tag and two words
 /// (`descriptor::record_at`).
 pub(crate) type Record = [u32; 3];
@@ -67,10 +81,15 @@ pub(crate) struct Picked<C> {
     forgotten: Option<Vec<u32>>,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
     full: bool,
+    retry_orphans: bool,
 }
 
 impl<C: Clone> Picked<C> {
     pub(crate) fn new(full: bool) -> Self {
+        Self::with_orphan_retries(full, no_self_mark())
+    }
+
+    fn with_orphan_retries(full: bool, retry_orphans: bool) -> Self {
         Picked {
             passes: 0,
             slots: HashMap::new(),
@@ -79,6 +98,7 @@ impl<C: Clone> Picked<C> {
             by_entry: HashMap::new(),
             forgotten: None,
             full,
+            retry_orphans,
         }
     }
 
@@ -139,7 +159,7 @@ impl<C: Clone> Picked<C> {
                 due.insert(slot);
             }
         }
-        let orphans_too = pass.is_multiple_of(ORPHANS_EVERY);
+        let orphans_too = self.retry_orphans || pass.is_multiple_of(ORPHANS_EVERY);
         for (&slot, &seen) in &self.orphans {
             if orphans_too || record(slot) != Some(seen) {
                 due.insert(slot);
@@ -363,6 +383,29 @@ mod tests {
         }
         let due = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
         assert_eq!(due, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn skipping_self_marks_retries_orphans_without_revisiting_unchanged_views() {
+        let mut heap = heap(4);
+        let mut p = Picked::with_orphan_retries(false, true);
+        pass(&mut p, &heap, vec![], vec![]);
+        p.orphan(3, heap.record(3).unwrap(), Some(103));
+        // Retry on the very next pass, not after 16. The synthetic host now
+        // has its copy; subsequent passes must leave this valid view alone.
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]), vec![3]);
+        assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
+        // Still unavailable: it must remain eligible on every pass.
+        for _ in 0..3 {
+            p.orphan(3, heap.record(3).unwrap(), Some(103));
+            assert_eq!(pass(&mut p, &heap, vec![], vec![]), vec![3]);
+        }
+        // Changes through the API, direct writes and freed entries still
+        // invalidate otherwise valid views without self-marks.
+        heap.records.insert(0, [1, 500, 1]);
+        heap.records.insert(1, [1, 501, 1]);
+        assert_eq!(pass(&mut p, &heap, vec![0], vec![102]), vec![0, 1, 2]);
+        assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
     }
 
     #[test]

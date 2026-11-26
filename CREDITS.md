@@ -1,5 +1,11 @@
 # Credits
 
+Local buffer-pass experiment (2026-11-26): OpenAI Codex (GPT-6), at the
+direction of GiovannaSGuerrera. The opt-in change builds on this tree's existing
+heap-pass self-mark suppression and incremental planner; it preserves per-pass
+orphan retries and adds local CPU/GPU sampling. Existing source credits below
+remain applicable.
+
 This tree is published as a single source snapshot, so the history that
 credited each change commit by commit is not part of it. This file carries
 that credit instead. People are named by their public GitHub login, or by the

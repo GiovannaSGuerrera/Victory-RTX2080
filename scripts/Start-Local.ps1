@@ -1,9 +1,18 @@
-﻿param([switch]$ExperimentalBakeBudget)
+﻿param([switch]$ExperimentalBakeBudget, [switch]$ExperimentalBufferPass)
 
 $ErrorActionPreference = 'Stop'
 
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $exe = Join-Path $root 'victory-8gb\target\release\victory.exe'
+if ($ExperimentalBufferPass) {
+    if ($ExperimentalBakeBudget) { throw 'Teste uma mudanca por vez sobre MAPPING_RANGES.' }
+    $exe = Join-Path $root 'victory-8gb\target\release\victory-buffer-pass.exe'
+    $env:VICTORY_MAPPING_RANGES = '1'
+    $env:VICTORY_HEAP_PASS_NO_SELF_MARK = '1'
+} else {
+    [Environment]::SetEnvironmentVariable('VICTORY_HEAP_PASS_NO_SELF_MARK', $null, 'Process')
+}
+
 $gameDir = Join-Path $root 'GTA6.Xbox.v1.0.2.1-CYBERLEEK'
 $game = Join-Path $gameDir 'game_scarlett_master.exe'
 $env:VICTORY_CONFIG = Join-Path $root 'auditoria\victory-8gb-local.toml'
@@ -83,6 +92,27 @@ $process = Start-Process -FilePath $exe -WorkingDirectory $gameDir -PassThru -Wi
     -ArgumentList @('run', ('"' + $game + '"'), '--execute', '--console', 'series-s', '--unimplemented', 'trap') `
     -RedirectStandardOutput (Join-Path $logs 'stdout.txt') `
     -RedirectStandardError (Join-Path $logs 'stderr.txt')
+
+if ($ExperimentalBufferPass) {
+    $metadata = @{
+        experiment = 'buffer-pass-no-self-mark'
+        binary = $exe
+        sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+        process_id = $process.Id
+        mapping_ranges = '1'
+        heap_pass_no_self_mark = '1'
+        bake_textures_ms = 'default (unset)'
+        usage_interval_seconds = 5
+    }
+    $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $logs 'experiment.json')
+    $sampler = Join-Path $PSScriptRoot 'Measure-LocalUsage.ps1'
+    $shell = (Get-Process -Id $PID).Path
+    Start-Process -FilePath $shell -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-File', ('"' + $sampler + '"'),
+        '-TargetProcessId', $process.Id, '-OutputPath',
+        ('"' + (Join-Path $logs 'usage.jsonl') + '"'), '-IntervalSeconds', '5'
+    ) -RedirectStandardError (Join-Path $logs 'usage-errors.txt') | Out-Null
+}
 
 $deadline = [DateTime]::UtcNow.AddSeconds(60)
 do {

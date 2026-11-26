@@ -1264,7 +1264,7 @@ pub(crate) fn passing() -> impl Drop {
             PASSING.with(|p| p.set(false));
         }
     }
-    PASSING.with(|p| p.set(heap_pass_unmarked()));
+    PASSING.with(|p| p.set(heap_pass_unmarked() || crate::heap_pass::no_self_mark()));
     Passing
 }
 
