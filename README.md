@@ -1,250 +1,164 @@
-# VIctory fork (work in progress)
+# Victory RTX 2080
 
-**This tree has one focus for now: the title's Series S mode on NVIDIA cards
-with 8 GB of memory and older CPUs.** Other hardware may work, but it is not
-tested or tuned here.
+Runtime experimental em Rust para executar GTA VI no Windows com uma NVIDIA RTX 2080 de 8 GB. O projeto reúne carregamento nativo de código x86-64, compatibilidade com serviços Xbox e tradução gráfica para DirectX 12, com um perfil local de execução em modo Series S.
 
-A source snapshot of a fork of [VIctory](https://github.com/Marvisak/VIctory)
-by Marvisak and its contributors, a compatibility layer that runs an Xbox
-Series title natively on Windows from files the user supplies. It is based on
-[fxceless/victory-fork](https://github.com/fxceless/victory-fork) at its commit
-`c96b4f2b` and adds changes from that fork's pull requests, from other forks,
-and of its own. This snapshot has no commit history; CREDITS.md names who
-wrote what and where it came from.
+**Estado atual:** inicialização, apresentação de conteúdo 3D e controle do personagem confirmados em uma máquina local. O desempenho ainda é muito baixo, há defeitos de renderização e ocorreram crashes. Este repositório preserva um estado recuperável de desenvolvimento; não representa uma versão estável ou uma conversão completa do jogo para PC.
 
-**Source code only.** No game files, dumps, shader caches or built programs are
-distributed here, and none will be. You need your own legally obtained copy of
-the game. This project is not affiliated with or endorsed by the title's
-publisher or the console maker. Licensed GPL-3.0-or-later; built with AI
-assistance. See [CREDITS.md](CREDITS.md), [CONTRIBUTING.md](CONTRIBUTING.md)
-and [AGENTS.md](AGENTS.md).
+## O que já foi observado
 
-## Test machine and status (measured 2026-11-25)
-
-Windows 11, NVIDIA RTX 3070 8 GB (driver 621.24), AMD Ryzen 5 3600 (6 cores /
-12 threads), 32 GB RAM; the title's Series S mode at 1920x1080 output, with the
-switches in the table below.
-
-- The first story mission was played from start to end in one 103-minute run
-  without a crash; a manual save was written and loaded again (on an earlier
-  build of this tree).
-- Frame times, as medians of the 5-second log lines: open water about
-  141-168 ms (6-7 fps); medium scenes with 4,400-7,000 draws 180-250 ms;
-  heavy scenes (town, dense foliage, 7,000-10,000 draws) 240-340 ms (3-4 fps).
-- The newest build in this snapshot has had two short runs only.
-
-## New in this snapshot (compared with the fork it is based on)
-
-- Table constants read in place (ported from upstream `683ad7a9`): descriptor
-  tables holding a constant buffer no longer need fresh slots for every draw.
-  Measured here: waits for slots 285-400 ms a frame (summed over threads) ->
-  0; slots asked 163-193 thousand -> 62-96 thousand a frame.
-- Texture copy-back for the boat (from vx-layer), with hardening.
-- Read-back tracking and four correctness fixes: stale data between lists of
-  one submission, the extent of a boxed read-back, table reuse across a title
-  write, and the present's wait policy.
-- Six shader translator fixes.
-- Descriptor heap lock split (fork PR #1146).
-- Series S profile (fork PR #188).
-
-## Known problems
-
-- Slow (see the frame times above).
-- The picture's exposure flashes unless `VICTORY_LATE_WAIT=2` is set; that
-  wait costs 70-90 ms a frame in heavy scenes.
-- Stalls while the texture refresh waits for title memory to stop moving.
-- With `VICTORY_BAKE_TEXTURES_MS=0`, characters can be baked dark at first.
-- Shaded areas can be black: bounced light does not run.
-- Foliage looks dotted in Series S.
-- Eight compute programs are refused by the translator.
-- No autosave was seen during a mission.
-- The first launch after a change to the shader translator translates every
-  shader again (about 20 minutes on the test machine).
-- Many changes here are specific to this title, and some are marked
-  `shortcut:` in the code where they approximate what the console does.
-- A few style lints are switched off in the workspace `Cargo.toml` until the
-  newer code is tidied.
-
-## Switches used on an 8 GB card
-
-Environment variables, set before starting `victory.exe`. Each is described
-in a comment where the code reads it.
-
-| Switch | What it does |
+| Etapa | Resultado local |
 |---|---|
-| `VICTORY_SKIP_BINK=1` | skips the title's movies that play once (the intro); `=all` also skips looping ones |
-| `VICTORY_TEXTURE_DROP_MIPS=1` | host copies of 2D textures the title fills (at least 512 texels on the shorter side) leave out their largest mip level, about three quarters of their bytes; shaders see them at half size |
-| `VICTORY_SMALL_TEXTURE_KB=0` | turns off letting small textures (up to 1024 KB by default, within a 384 MB reserve) onto a card that is out of room; with `0` they are refused while the card is full, as before |
-| `VICTORY_QUEUE2=1` | the relay's fetches of card copies run on a dedicated D3D12 copy queue (same as `VICTORY_RELAY_COPY_QUEUE=1`); pieces fetched beside a later flight are fetched again by it. Ignored with `VICTORY_CARD_FETCH_INFLIGHT=1` |
-| `VICTORY_INDIRECT_WINDOW=1` | indirect draws that read record after record of one argument buffer are clamped a window of records at a time (16 up to 64) instead of one compute pass per record |
-| `VICTORY_ASYNC_SUBMIT=1` | the title's submissions are queued and prepared and sent by a thread of the layer's own (needs `VICTORY_LATE_WAIT`) |
-| `VICTORY_ASYNC_SUBMIT_SAFE=0` | with `VICTORY_ASYNC_SUBMIT=1`, the title's thread no longer waits until its submission has finished reading title memory; those reads overlap the title |
-| `VICTORY_CARD_HASH_WIDE=1` | the hash pass over copies in the card's memory gives each 64 KiB piece a group of 256 threads instead of one thread |
-| `VICTORY_BAKE_TEXTURES_MS=0` | no extra texture-upload budget (1,500 ms by default, which stalled for seconds) before the title's decoration bake draws; the texture flush before each bake draw (`VICTORY_BAKE_FLUSH`, on by default) still runs |
-| `VICTORY_LATE_WAIT=2` | submissions go to the card without a wait for each and are settled together where the title can observe them; at stage 2, bytes the title changed under a flight's writes are merged in instead of settling the flights |
-| `VICTORY_BACK_SETTLE=0` | a present sent ahead waits only for flights that copy shader-written textures back, not for every flight that copies small results back to title memory; it applies only when the present is sent ahead (`VICTORY_LATE_WAIT` 3 or the relay), since at stage 2 the present waits for everything; set explicitly, it also keeps the present off `VICTORY_FRAME_FEEDBACK=2`'s policy |
-| `VICTORY_LAND_ASIDE=1` | the command lists of landed flights are reset on a thread of their own instead of at the end of each submission (off by default) |
+| Compilação em Release | Concluída com Rust 1.98.1, MSVC e Windows SDK |
+| Carregamento e imports | Executável preparado e dependências resolvidas na sessão validada |
+| Janela e telas iniciais | Janela com área cliente de 1280×720 e seleção de conta visível |
+| Cena 3D | Personagens, cabelo, roupas, construções, vegetação e iluminação visíveis |
+| Interação | O usuário confirmou conseguir jogar; não foi validada a conclusão de uma missão |
+| Desempenho | Amostras recentes entre aproximadamente 0,3 e 2,5 FPS em cenas pesadas; não é benchmark controlado |
+| Estabilidade e imagem | Ainda há crashes, superfícies pretas, exposição excessiva e draws descartados |
 
-If materials look wrong, `VICTORY_TABLE_CONSTANTS=0` turns off reading table
-constants in place: every table constant is then copied for the draw into
-upload memory, as before (more descriptor slots, slower).
+Esses resultados foram observados em **Windows 11, RTX 2080 8 GB e aproximadamente 32 GB de RAM**. Os 30 FPS vistos em algumas telas iniciais não correspondem ao desempenho do cenário. Não foram feitos testes comparativos em outras máquinas neste projeto.
 
-## Building
+## Como o runtime funciona
 
-Requirements and further commands are in the upstream README below. The
-commands this repository documents:
+O código de CPU do título já é x86-64. O loader prepara e mapeia sua imagem PE no processo do runtime, resolve imports e administra a infraestrutura necessária à execução. A adaptação principal está nas APIs, nos recursos gráficos e nos shaders do console.
+
+```mermaid
+flowchart LR
+    A[Arquivos locais do usuário] --> B[Loader PE x86-64]
+    B --> C[Serviços e APIs HLE]
+    B --> D[Comandos D3D12.X]
+    D --> E[Recursos e pipelines D3D12]
+    F[Shaders GFX10] --> G[Tradução para DXIL]
+    G --> E
+    E --> H[Janela no Windows]
+```
+
+O workspace separa essas responsabilidades:
+
+| Componente | Responsabilidade no código |
+|---|---|
+| `apps/victory` | CLI de configuração, inspeção, tradução e execução |
+| `victory-core` | Configuração, logging, caminhos e guardas para manter dados externos ao repositório |
+| `victory-pe` / `victory-loader` | Estruturas PE, preparação, mapeamento, binding e diagnóstico de falhas |
+| `victory-hle` | Implementações de serviços de sistema, memória, arquivos, entrada, áudio, armazenamento e operações assíncronas; cobertura parcial |
+| `victory-gpu` | Objetos D3D12.X, comandos, heaps, descritores, cópias, sincronização, pipelines e apresentação em D3D12 |
+| `victory-shader` | Decodificação GFX10, representação intermediária, análise de recursos e emissão DXIL |
+| `victory-formats` | Layouts e conversões de formatos, incluindo texturas e áudio |
+| `victory-pipeline` | Conversões e cache por conteúdo |
+| `victory-game` | Identificações e integrações específicas do título |
+| `xtask` | Verificação da política de arquivos do repositório |
+
+Implementação de uma API ou formato não significa compatibilidade completa. Pipelines que falham na tradução ou são recusados pelo driver ainda podem impedir partes da imagem de aparecerem.
+
+## Compilar
+
+Requisitos para o runtime gráfico: Windows x64, CPU com AVX2, GPU Direct3D 12 com Shader Model 6.6 e mesh shaders para o cenário, ferramentas MSVC e Windows SDK. A versão Rust está fixada em `rust-toolchain.toml`.
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
+git clone https://github.com/GiovannaSGuerrera/Victory-RTX2080.git
+cd Victory-RTX2080
+cargo build --release --locked -p victory
 ```
 
-A build with debugging aids:
+O executável é gerado em `target\release\victory.exe`. Com as dependências já disponíveis no cache Cargo, a compilação também pode usar `--offline`.
+
+## Configurar e executar
+
+Crie `victory.toml` a partir de `victory.example.toml`. Ajuste os caminhos para seus arquivos, sempre fora do repositório. Separe cache de dados persistentes:
+
+```toml
+[paths]
+game_dir = 'D:\VictoryLocal\game'
+cache_dir = 'D:\VictoryLocal\cache'
+data_dir = 'D:\VictoryLocal\data'
+```
+
+Confira a configuração antes de iniciar:
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+.\target\release\victory.exe config
+.\target\release\victory.exe run 'D:\VictoryLocal\game\game_scarlett_master.exe' --execute --console series-s
 ```
 
-## What the fork this tree is based on changed (summary)
+Use o executável junto ao manifesto e às dependências do pacote. Informar apenas `game_dir` não substitui o argumento do executável no comando `run`. Sem `--execute`, o comando termina depois da preparação e resolução de imports.
 
-As described by fxceless/victory-fork; measurements are from that fork's own
-test machine (Windows 11, i7-14700KF, RTX 4070 12 GB), not from the machine
-above.
+### Perfil local preservado
 
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+O checkpoint inclui `scripts/Start-Local.ps1`, a configuração de referência e o [registro de recuperação](docs/local-playable-checkpoint.md). Esse launcher foi feito para a estrutura local `J:\GTA6\victory-8gb`; seus caminhos devem ser ajustados antes de usá-lo em outro diretório. O comando manual acima funciona independentemente dessa organização.
 
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`).
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
-- Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 % (`VICTORY_SHADER_OPT=0` turns them off).
+As opções do perfil preservado são:
 
-`VICTORY_TEXTURE_DROP_MIPS` (see the table above) came from a pull request
-to that fork; its author measured about 210 ms a frame in the first room
-instead of about 430 on an RTX 4060 Ti 8 GB.
+| Opção | Valor | Finalidade |
+|---|---|---|
+| `VICTORY_DISPLAY_MODE` | `1280x720` | Modo de saída solicitado; o launcher também verifica a área cliente da janela |
+| `VICTORY_PIPELINE_SMALL_FIRST` | `1` | Prioriza pipelines menores e limita a concorrência dos computes grandes |
+| `VICTORY_TEXTURE_DROP_MIPS` | `1` | Omite o maior mip de texturas elegíveis para reduzir seu tamanho no host |
+| `VICTORY_SMALL_TEXTURE_KB` | `0` | Desativa a reserva adicional para admitir texturas pequenas quando a placa está cheia |
+| `VICTORY_QUEUE2` | `1` | Usa uma fila de cópia dedicada para buscas do relay quando aplicável |
+| `VICTORY_INDIRECT_WINDOW` | `1` | Processa argumentos de draws indiretos em janelas de registros |
+| `VICTORY_ASYNC_SUBMIT` | `1` | Prepara e submete comandos por uma thread do runtime |
+| `VICTORY_ASYNC_SUBMIT_SAFE` | `1` | Mantém a espera segura de leitura da memória do título |
+| `VICTORY_CARD_HASH_WIDE` | `1` | Amplia o grupo de threads do passe de hash na GPU |
+| `VICTORY_LATE_WAIT` | `2` | Adia esperas e reconcilia escritas conforme a política desse estágio |
+| `VICTORY_BACK_SETTLE` | `0` | Seleciona a política explícita de espera da apresentação, quando aplicável |
 
-Everything below this line is upstream VIctory's README as this fork took it
-over (its status section, which described upstream at that time, is left out).
+O launcher padrão **não aplica** `VICTORY_BAKE_TEXTURES_MS=0`. Esse ajuste foi preparado para investigar pausas em texturas e ficou disponível apenas com `-ExperimentalBakeBudget`: não havia validação dele na sessão confirmada como jogável. O carregamento de texturas antes dos bake draws continua com `BAKE_FLUSH` ativo por padrão.
 
----
+A opção de prioridade de pipelines foi habilitada ao mesmo tempo em que se reaproveitou um cache anterior. O aparecimento do cenário não permite atribuir a melhora exclusivamente a essa opção.
 
-# VIctory
+## Cache, entrada e diagnóstico
 
-Runs the title (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+O runtime mantém traduções e uma biblioteca de pipelines para reutilização. O cache de shaders considera a identidade do tradutor; mudanças nele podem exigir nova tradução. Uma primeira execução pode levar vários minutos compilando, e um checkout do Git não contém o cache já produzido localmente.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+Para pré-traduzir shaders usando a configuração escolhida:
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+.\target\release\victory.exe translate 'D:\VictoryLocal\game' --cache
 ```
 
-Run the title:
+Para inspeção e validação:
 
 ```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+.\target\release\victory.exe inspect 'D:\VictoryLocal\game\game_scarlett_master.exe' --imports
+.\target\release\victory.exe census 'D:\VictoryLocal\game' --missing
+.\target\release\victory.exe translate 'D:\VictoryLocal\game' --validate --pipelines
 ```
 
-`VICTORY_SKIP_BINK=1` skips the title's movies that play once (logos and
-the intro); `VICTORY_SKIP_BINK=all` skips the looping ones too, so menu
-backgrounds stay dark.
-
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-## Debugging
-
-A release build has no debugging aids. Build them in with
+A validação DXIL utiliza `dxil.dll`, indicada por `VICTORY_DXIL` ou descoberta no Windows SDK. O build de diagnóstico habilita ferramentas adicionais:
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo build --profile diag --locked -p victory --features diagnostics
 ```
 
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+Controle: gamepad XInput ou teclado como controle, quando aplicável e com a janela em foco. `Enter` corresponde a A, `Backspace` a B, `Esc` ao menu, `Tab` a View; WASD e IJKL controlam os sticks. X/Y, Q/E, Z/C e F/H completam os botões descritos no código de entrada.
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+## Limitações em investigação
 
-## License
+- **Pausas em texturas:** logs registraram quadros de cerca de dois segundos, com grande parte do tempo na preparação de texturas e esperas pela memória do título.
+- **Pipelines recusados:** zerar a fila de compilação não elimina falhas de criação ou draws descartados.
+- **Imagem incompleta:** há exposição excessiva, regiões escuras, vegetação pontilhada e partes do cenário ausentes. Uma imagem isolada não determina se a causa é textura, shader, geometria ou sincronização.
+- **Memória:** o processo e a memória compartilhada da GPU podem consumir bastante commit do Windows. A pressão de memória foi observada, mas não foi comprovada como causa única dos crashes.
+- **Estabilidade:** houve uma exceção de escrita em endereço nulo (`0xC0000005`); a causa efetiva permanece sem correção confirmada.
+- **Ray tracing:** o código contém suporte experimental. Não há validação local de iluminação completa por ray tracing.
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Os dados do título, saves e cache ficam no computador do usuário. Este repositório contém código, ferramentas e documentação; não distribui arquivos do jogo, capturas, dumps ou executáveis do título, nem fornece chaves ou mecanismos para contornar proteções.
+
+## Checkpoint e desenvolvimento
+
+O estado local recuperável está marcado por `checkpoint-jogavel-2026-11-25`, com o commit `f7f765c`. O [manifesto](docs/local-playable-checkpoint.json) registra o build e o [guia](docs/local-playable-checkpoint.md) explica sua recuperação. O checkpoint do código não é um save da missão.
+
+Verificações disponíveis no projeto:
+
+```powershell
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo run --release --locked -p xtask -- policy
+```
+
+A compilação Release, o parser do launcher, a leitura da configuração e a política de arquivos do checkpoint foram verificados localmente. Não se afirma que toda a suíte de testes ou o clippy tenham sido executados para este checkpoint.
+
+A próxima etapa é reproduzir as falhas na mesma cena, separar custos de CPU/GPU e corrigir recursos e pipelines sem perder a referência que já apresentou conteúdo real.
+
+## Licença e contribuições
+
+GPL-3.0-or-later. Consulte [LICENSE](LICENSE), [CREDITS.md](CREDITS.md), [CONTRIBUTING.md](CONTRIBUTING.md) e a [política de arquivos](docs/asset-policy.md). Preserve os avisos e as atribuições ao redistribuir ou modificar o código.
