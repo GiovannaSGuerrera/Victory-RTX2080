@@ -359,9 +359,26 @@ fn big_workers() -> usize {
     })
 }
 
-/// The workers [`workers`] starts: half the logical processors, 2 to 8.
+/// Adapted from fork-cgbj f4b48ad7: explicit worker control, preserving
+/// local defaults. VICTORY_PIPELINE_WORKERS selects 1..8; unset/invalid
+/// uses half the logical processors, 2..8. No memory-heavy 64-worker profile.
 fn worker_count() -> usize {
-    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| worker_count_for(
+        std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
+        std::thread::available_parallelism().map_or(4, |n| n.get()),
+    ))
+}
+
+fn worker_count_for(asked: Option<usize>, processors: usize) -> usize {
+    asked.map_or_else(|| (processors / 2).clamp(2, 8), |n| n.clamp(1, 8))
+}
+
+/// VICTORY_PIPELINE_LOWEST=1 lowers preparation priority further; the
+/// default remains BELOW_NORMAL. Adapted from fork-cgbj f4b48ad7.
+fn lowest_priority() -> bool {
+    static LOW: OnceLock<bool> = OnceLock::new();
+    *LOW.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOWEST").is_some_and(|v| v == "1"))
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
@@ -404,6 +421,7 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = worker_count();
+        tracing::info!(workers, lowest = lowest_priority(), "local pipeline worker configuration");
         if small_first() {
             tracing::info!(
                 workers,
@@ -420,7 +438,8 @@ fn workers() -> bool {
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let priority = if lowest_priority() { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                        let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
                         let p = next();
@@ -475,6 +494,17 @@ mod tests {
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
+    #[test]
+    fn explicit_pipeline_worker_count_preserves_defaults_and_bounds() {
+        for (cpus, expected) in [(0,2),(1,2),(4,2),(12,6),(128,8)] {
+            assert_eq!(worker_count_for(None, cpus), expected);
+        }
+        assert_eq!(worker_count_for(Some(0),12),1);
+        assert_eq!(worker_count_for(Some(4),12),4);
+        assert_eq!(worker_count_for(Some(64),12),8);
+        assert_eq!(worker_count_for(Some(usize::MAX),12),8);
+    }
+
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));

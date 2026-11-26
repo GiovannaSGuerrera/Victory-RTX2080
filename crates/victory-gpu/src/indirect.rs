@@ -157,7 +157,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
                 if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                    next = (BUDGET - next < c) ? (RECOVER ? next : BUDGET) : (next + c);
                 }
             }
             if (next == before) break;
@@ -172,7 +172,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             uint fit = 1;
             if (c > 0) {
                 fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+                at = (at >= BUDGET || BUDGET - at < c) ? (RECOVER ? at : BUDGET) : (at + c);
             }
             fits[k] = fit;
         }
@@ -242,6 +242,14 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    // VICTORY_INDIRECT_RECOVER=1 rejects an oversized record without spending
+    // the remaining list budget. Off by default; fork-cgbj f4b48ad7 adaptation.
+    let recover = std::env::var_os("VICTORY_INDIRECT_RECOVER").is_some_and(|v| v == "1");
+    make_from_policy(device, source, recover)
+}
+
+fn make_from_policy(device: &ID3D12Device, source: &str, recover: bool) -> windows::core::Result<Clamp> {
+    let source = format!("#define RECOVER {}\n{source}", u32::from(recover));
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2046,6 +2054,78 @@ void main() {
             assert_eq!(out[i * 4..i * 4 + 4], [0, 0, 7, 9], "record {i} runs empty");
         }
         assert_eq!(spent, BUDGET_CAP, "the record that did not fit took the rest");
+    }
+
+    #[test]
+    fn warp_oversized_record_preserves_budget_for_following_valid_records() {
+        for recover in [false, true] {
+        let mut warp = WarpHarness::new().expect("WARP is required for recovery validation");
+        warp.clamp = make_from_policy(&warp.device, SOURCE, recover).expect("compile actual clamp");
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+        const BUDGET_CAP: u32 = 1 << 27;
+        let counts = [100u32, 250, 50, 100, 50, 1];
+        let total = counts.len() * STRIDE as usize;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+        let dst_buf = warp.default_uav(total as u64);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            for (i, &count) in counts.iter().enumerate() {
+                let words = [count, 1, 7, 9];
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr().cast::<u8>(),
+                    src_ptr.add(i * STRIDE as usize),
+                    16,
+                );
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - 300);
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DRAW, STRIDE, counts.len() as u32),
+            false,
+        ));
+        // SAFETY: an open list; the clamped records are copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
+                    .to_vec(),
+            )
+        };
+        assert_eq!(out[0..4], [100, 1, 7, 9], "the first record fits");
+        if recover {
+            assert_eq!(out[4..8], [0,0,7,9], "oversized record is refused");
+            assert_eq!(out[8..12], [50,1,7,9], "later small record survives");
+            assert_eq!(out[12..16], [100,1,7,9]);
+            assert_eq!(out[16..20], [50,1,7,9], "exact fit is accepted");
+            assert_eq!(out[20..24], [0,0,7,9], "spent budget still blocks more work");
+            assert_eq!(spent, BUDGET_CAP);
+        } else {
+            for i in 1..counts.len() {
+                assert_eq!(out[i*4..i*4+4], [0,0,7,9]);
+            }
+            assert_eq!(spent, BUDGET_CAP);
+        }
+        }
     }
 
     /// The list's budget starts empty at each submission, wherever it

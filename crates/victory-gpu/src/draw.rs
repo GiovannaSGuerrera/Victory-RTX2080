@@ -309,6 +309,9 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    host_targets: crate::bind_cache::BindingCache<(Vec<(usize, (usize, [u32; 7]))>, Option<(usize, (usize, [u32; 7]))>)>,
+    // Keep cached identities alive against pointer reuse until invalidation.
+    host_target_resources: Vec<ID3D12Resource>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -892,7 +895,9 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut resources = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -912,14 +917,17 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            views.push((Some(texture), record.desc()));
+            resources.push(texture.clone());
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -932,8 +940,24 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            resources.push(texture.clone());
+            Some((texture, record))
         });
+        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        // VICTORY_BIND_CACHE=1 skips only identical target/depth bindings.
+        // Disabled by default; adapted from fork-cgbj f4b48ad7.
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *CACHE.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_some_and(|v| v == "1"));
+        if enabled {
+            BIND_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+            if !self.host_targets.update(now) {
+                BIND_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            self.host_target_resources = resources;
+        }
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -997,6 +1021,8 @@ impl State {
     /// tables stay: they are in this host list. The pass leaves the blend
     /// factor, stencil reference and depth bounds alone.
     fn after_our_pass(&mut self, list: &HostList) {
+        self.host_targets.clear();
+        self.host_target_resources.clear();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [usize::MAX; 2];
@@ -1029,6 +1055,8 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.host_targets.clear();
+        self.host_target_resources.clear();
         self.clear_upload_tables();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -4552,4 +4580,9 @@ mod early_textures_tests {
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10);
         assert_eq!(release(heap), 0);
     }
+}
+
+static BIND_COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+pub(crate) fn take_bind_counts() -> [u64; 2] {
+    BIND_COUNTS.each_ref().map(|v| v.swap(0, Ordering::Relaxed))
 }

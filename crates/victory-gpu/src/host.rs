@@ -8155,6 +8155,10 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
+        let [bind_calls, bind_hits] = crate::draw::take_bind_counts();
+        if bind_calls != 0 {
+            tracing::info!(calls = bind_calls, skipped = bind_hits, "target binding cache (VICTORY_BIND_CACHE=1)");
+        }
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
