@@ -16,7 +16,25 @@ Runtime experimental em Rust para executar GTA VI no Windows com uma NVIDIA RTX 
 | Desempenho | Amostras recentes entre aproximadamente 0,3 e 2,5 FPS em cenas pesadas; não é benchmark controlado |
 | Estabilidade e imagem | Ainda há crashes, superfícies pretas, exposição excessiva e draws descartados |
 
-Esses resultados foram observados em **Windows 11, RTX 2080 8 GB e aproximadamente 32 GB de RAM**. Os 30 FPS vistos em algumas telas iniciais não correspondem ao desempenho do cenário. Não foram feitos testes comparativos em outras máquinas neste projeto.
+Os 30 FPS vistos em algumas telas iniciais não correspondem ao desempenho do cenário. Não foram feitos testes comparativos em outras máquinas neste projeto.
+
+## PC utilizado nos testes
+
+Especificações consultadas diretamente no Windows e no driver NVIDIA em **25/11/2026**:
+
+| Componente | Configuração |
+|---|---|
+| Processador | AMD Ryzen 5 5500 — 6 núcleos e 12 threads |
+| Placa de vídeo | NVIDIA GeForce RTX 2080 — 8 GB de VRAM (8192 MiB) |
+| Driver NVIDIA | 621.14 |
+| Memória RAM | 32 GB, em 2 módulos de 16 GB; velocidade configurada informada pelo Windows: 2133 |
+| Placa-mãe | ASUS PRIME B450M-GAMING/BR |
+| Sistema operacional | Windows 11 Pro x64 — versão 10.0.26300, build 26300 |
+| SSD do projeto e arquivos locais (`J:`) | Kingston A400, modelo SA400S37960G — SATA, aproximadamente 894 GiB |
+| Segundo SSD | WDC WDS480G2G0B-00EPW0 — SATA, aproximadamente 447 GiB |
+| Perfil do runtime | Series S, janela com área cliente 1280×720 |
+
+As capacidades dos SSDs acima estão em GiB, conforme o tamanho consultado no sistema. A configuração descreve a máquina de desenvolvimento e os resultados locais; não estabelece requisitos mínimos nem garante desempenho equivalente em outro PC.
 
 ## Como o runtime funciona
 
