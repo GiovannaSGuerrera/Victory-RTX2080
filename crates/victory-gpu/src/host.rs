@@ -39,10 +39,19 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Staging buffer pool entry (system memory, write-back).
+#[derive(Debug)]
+struct StagingPoolEntry {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    uses: u64,
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     depth_scratch: Mutex<Vec<(u64, ID3D12Resource)>>,
+    staging_pool: Mutex<Vec<(u64, StagingPoolEntry)>>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -673,6 +682,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             depth_scratch: Mutex::default(),
+            staging_pool: Mutex::default(),
             fence,
             submitted: Mutex::new(0),
             event,
@@ -4191,7 +4201,7 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.shared_buffer_pooled(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4234,7 +4244,7 @@ impl Host {
             let bytes = compile(CARD_FETCH, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
             let slots = inflight_slots(inflight_fetch_bytes());
             let table_bytes = u64::from(slots) * 4 + results;
-            let (table, table_data) = self.shared_buffer(table_bytes).ok_or_else(windows::core::Error::empty)?;
+            let (table, table_data) = self.shared_buffer_pooled(table_bytes).ok_or_else(windows::core::Error::empty)?;
             name(&table, || "card fetch in flight: tickets".into());
 
             // SAFETY: the blob's own bytes; the root signature is inside
@@ -4667,7 +4677,7 @@ impl Host {
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
             list.Close().ok()?;
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-            let (buffer, data) = self.shared_buffer(u64::from(slots) * INFLIGHT_SLOT)?;
+            let (buffer, data) = self.shared_buffer_pooled(u64::from(slots) * INFLIGHT_SLOT)?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(InflightDown {
                 queue,
@@ -4829,7 +4839,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.shared_buffer_pooled(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -5253,7 +5263,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_buffer_pooled(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -8155,10 +8165,6 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
-        let [bind_calls, bind_hits] = crate::draw::take_bind_counts();
-        if bind_calls != 0 {
-            tracing::info!(calls = bind_calls, skipped = bind_hits, "target binding cache (VICTORY_BIND_CACHE=1)");
-        }
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -8808,6 +8814,71 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// Staging buffer pool (system memory, write-back): reuses buffers by
+    /// size class (power of two, min 64 KiB). Avoids repeated
+    /// CreateCommittedResource+Map for common sizes (inflight, copy-back, compare).
+    fn shared_buffer_pooled(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let class = size.max(1 << 16).checked_next_power_of_two()?;
+        let mut pool = self.staging_pool.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, entry)) = pool.iter_mut().find(|(sz, _)| *sz == class) {
+            // Reuse existing: reset pointer (buffer already mapped)
+            let buffer = entry.buffer.clone();
+            let data = entry.data.cast();
+            entry.uses += 1;
+            return Some((buffer, data));
+        }
+        // Create new
+        crate::census::made(2, class);
+        MADE[2].fetch_add(1, Ordering::Relaxed);
+        MADE[3].fetch_add(class, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: class.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => {
+                let buffer = buffer?;
+                let data = data.cast();
+                pool.push((class, StagingPoolEntry { buffer: buffer.clone(), data, uses: 1 }));
+                Some((buffer, data))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, size = class, "no pooled staging buffer");
                 None
             }
         }
