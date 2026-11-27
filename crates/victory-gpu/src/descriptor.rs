@@ -9,6 +9,7 @@
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
+use std::cell::RefCell;
 
 #[cfg(windows)]
 pub(crate) mod host;
@@ -97,7 +98,7 @@ impl Heap {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
                 for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
+                    h.mirror_no_view(i, self.start + u64::from(i) * step, false);
                 }
                 Some(std::sync::Arc::new(h))
             })
@@ -153,7 +154,7 @@ fn mirror(handle: u64) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
-                host.mirror(index, handle, false);
+                host.mirror_no_view(index, handle, false);
             }
         }
     }
@@ -197,13 +198,6 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
-    /// Complete record identity, adapted from fork-cgbj f4b48ad7.
-    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
-        let mut words = [self.described; 7];
-        words[1..].copy_from_slice(&self.desc);
-        (self.resource as usize, words)
-    }
-
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -368,6 +362,37 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shape_index: std::collections::BTreeMap::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+// Thread-local view cache for a single draw/recording: avoids repeated
+// VIEWS RwLock lookups for the same view within one draw.
+thread_local! {
+    static DRAW_VIEW_CACHE: RefCell<Option<std::collections::HashMap<u64, View>>> =
+        const { RefCell::new(None) };
+}
+
+/// Begins a new draw/recording: enables the view cache.
+pub(crate) fn begin_draw_view_cache() {
+    DRAW_VIEW_CACHE.with(|c| *c.borrow_mut() = Some(std::collections::HashMap::new()));
+}
+
+/// Ends the current draw/recording: clears the view cache.
+pub(crate) fn end_draw_view_cache() {
+    DRAW_VIEW_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+/// Gets a view from the draw cache if present, otherwise looks it up.
+fn draw_view_cache_get(handle: u64) -> Option<View> {
+    DRAW_VIEW_CACHE.with(|c| c.borrow().as_ref().and_then(|m| m.get(&handle).cloned()))
+}
+
+/// Stores a view in the draw cache.
+fn draw_view_cache_put(handle: u64, view: View) {
+    DRAW_VIEW_CACHE.with(|c| {
+        if let Some(m) = c.borrow_mut().as_mut() {
+            m.insert(handle, view);
+        }
+    });
+}
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
@@ -554,11 +579,11 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    crate::buffer_profile::mirror_measure(6, || VIEWS.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    crate::buffer_profile::mirror_measure(7, || VIEWS.write().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -709,7 +734,7 @@ pub(crate) fn make_waiting() {
                 _ => false,
             };
             if same && let Some(Some(host)) = heap.host.get() {
-                host.mirror(index, handle, true);
+                host.mirror_no_view(index, handle, true);
             }
         }
     }
@@ -820,6 +845,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
+/// Uses the per-draw view cache when active to avoid repeated VIEWS RwLock lookups.
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
@@ -829,7 +855,15 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     if tag != VIEW_TAG {
         return None;
     }
-    view_at(i, generation)
+    // Check per-draw cache first
+    if let Some(cached) = draw_view_cache_get(handle) {
+        return Some(cached);
+    }
+    let view = view_at(i, generation);
+    if let Some(ref v) = view {
+        draw_view_cache_put(handle, v.clone());
+    }
+    view
 }
 
 /// A description of `N` words, if the title passes one.

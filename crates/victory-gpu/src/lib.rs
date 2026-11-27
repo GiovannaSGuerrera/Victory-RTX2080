@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod buffer_profile;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(any(windows, test))]
@@ -81,6 +83,3 @@ pub use watch::{
     title_memory_by_range, title_memory_reading, title_memory_remapped, title_memory_remapping,
     writing as kernel_will_write,
 };
-
-#[cfg(windows)]
-mod bind_cache;

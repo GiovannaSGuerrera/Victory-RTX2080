@@ -11,6 +11,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
+use crate::buffer_profile::{mirror_measure, mirror_path};
 use crate::host::host;
 
 /// The slots of one piece of [`HostHeap::kept`].
@@ -44,6 +45,11 @@ pub(crate) struct HostHeap {
     /// in list calls waiting here and in `kept`, profile of 2026-11-25 on
     /// a six-thread processor). `VICTORY_HEAP_LOCKS=0`: the lock always.
     made_now: Vec<std::sync::atomic::AtomicU64>,
+    /// Cached `View` for slots already made: avoids `VIEWS` RwLock + `view_at()`
+    /// when `made_now` matches. Only for slots that have been made (key != 0).
+    /// Written under `made` lock; read without lock on fast path (data race
+    /// benign: stale cache just misses fast path).
+    made_view: Mutex<Vec<Option<super::View>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -1379,6 +1385,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             made_now: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            made_view: Mutex::new(vec![None; count as usize]),
             kept: (0..(count + extra).div_ceil(KEPT_PIECE)).map(|_| Mutex::new(vec![None; KEPT_PIECE as usize])).collect(),
             next: Mutex::new({
                 let mut ring = Ring::new(slots as usize, dynamic_pack());
@@ -2244,35 +2251,46 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+
+        let view = mirror_measure(0, || (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten());
         // Made from this record already: nothing to do, and no lock.
         if view.is_some() && heap_locks() && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
+            // Fast path: return cached View if available, avoiding VIEWS RwLock
+            if let Some(cached) = self.made_view.lock().unwrap_or_else(|e| e.into_inner())[index as usize].as_ref() {
+                return Some(cached.clone());
+            }
+            mirror_path(1); // locked unchanged
             return view;
         }
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = mirror_measure(1, || self.made.lock().unwrap_or_else(|e| e.into_inner()));
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
-                self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
-                self.make_null(index);
-                let _ = self.note_buffer(index, None, false);
-            } else if for_draw {
-                // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
-            }
+            mirror_path(3); // invalid record
+            mirror_measure(2, || {
+                if made[index as usize] != 0 {
+                    made[index as usize] = 0;
+                    self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                    self.make_null(index);
+                    let _ = self.note_buffer(index, None, false);
+                } else if for_draw {
+                    // Left for later and stale since: out of the sets and the stride table.
+                    let _ = self.note_buffer(index, None, false);
+                }
+            });
             return None;
         };
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(&mut made, stale);
+            mirror_measure(2, || {
+                for stale in self.note_buffer(index, Some(&view), for_draw) {
+                    if stale != index {
+                        self.unmake(&mut made, stale);
+                    }
                 }
-            }
+            });
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -2298,20 +2316,105 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
+            let kept = mirror_measure(3, || if later {
                 None
             } else {
                 make(&view, self.cpu(index))
-            };
+            });
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                mirror_measure(5, || null_for(&view, self.cpu(index)));
             }
-            self.keep(index, kept.flatten());
+            mirror_measure(4, || self.keep(index, kept.flatten()));
             // After the slot is made: a reader without the lock takes the
             // record as made only once it is.
             self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
+            // Cache the View for future fast-path hits (avoids VIEWS RwLock + view_at)
+            self.made_view.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = Some(view.clone());
+            mirror_path(2); // rebuilt view
         }
         Some(view)
+    }
+
+    /// Like `mirror` but returns only whether the slot was made/updated,
+    /// avoiding `View` allocation for callers that only need success status.
+    pub(crate) fn mirror_no_view(&self, index: u32, handle: u64, for_draw: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            if !self.sampler {
+                crate::copystat::title_slot(index);
+            }
+        }
+        if index >= self.count {
+            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+                tracing::warn!(
+                    index,
+                    count = self.count,
+                    for_draw,
+                    "title slot past the host heap"
+                );
+            }
+            return false;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+
+        let view = mirror_measure(0, || (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten());
+        if view.is_some() && heap_locks() && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
+            mirror_path(1); // locked unchanged
+            return true;
+        }
+        let mut made = mirror_measure(1, || self.made.lock().unwrap_or_else(|e| e.into_inner()));
+        let Some(view) = view else {
+            mirror_path(3); // invalid record
+            mirror_measure(2, || {
+                if made[index as usize] != 0 {
+                    made[index as usize] = 0;
+                    self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                    self.make_null(index);
+                    let _ = self.note_buffer(index, None, false);
+                } else if for_draw {
+                    let _ = self.note_buffer(index, None, false);
+                }
+            });
+            return false;
+        };
+        if made[index as usize] != key {
+            mirror_measure(2, || {
+                for stale in self.note_buffer(index, Some(&view), for_draw) {
+                    if stale != index {
+                        self.unmake(&mut made, stale);
+                    }
+                }
+            });
+            let waiting = if for_draw { None } else { view.waiting_texture() };
+            if let Some(texture) = waiting {
+                super::wait_for(texture, handle);
+            }
+            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            if later
+                && keep_views()
+                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
+                    .is_some_and(|old| same_placed_texture(&old, &view))
+            {
+                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+            made[index as usize] = if later { 0 } else { key };
+            let kept = mirror_measure(3, || if later {
+                None
+            } else {
+                make(&view, self.cpu(index))
+            });
+            if kept.is_none() && !self.sampler {
+                mirror_measure(5, || null_for(&view, self.cpu(index)));
+            }
+            mirror_measure(4, || self.keep(index, kept.flatten()));
+            self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
+            mirror_path(2); // rebuilt view
+        }
+        true
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
