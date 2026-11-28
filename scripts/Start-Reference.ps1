@@ -1,17 +1,23 @@
+param([switch]$ExperimentalBufferPass)
+
 $ErrorActionPreference = 'Stop'
 
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$ExperimentalBufferPass = $true
-$ExperimentalBakeBudget = $false
-$exe = Join-Path $PSScriptRoot '..\target\release\victory-reference.exe'
-if (!(Test-Path -LiteralPath $exe)) { $exe = Join-Path $PSScriptRoot '..\target\release\victory.exe' }
-Get-ChildItem Env:VICTORY_* | ForEach-Object { [Environment]::SetEnvironmentVariable($_.Name, $null, 'Process') }
-$env:VICTORY_MAPPING_RANGES = '1'
-$env:VICTORY_HEAP_PASS_NO_SELF_MARK = '1'
-$env:VICTORY_BIND_CACHE = '1'
-$env:VICTORY_INDIRECT_RECOVER = '1'
-$env:VICTORY_PIPELINE_WORKERS = '4'
-$env:VICTORY_PIPELINE_LOWEST = '1'
+$exe = Join-Path $root 'victory-8gb\target\release\victory.exe'
+if ($ExperimentalBufferPass) {
+    $exe = Join-Path $root 'victory-8gb\target\release\victory-buffer-pass.exe'
+    $env:VICTORY_MAPPING_RANGES = '1'
+    $env:VICTORY_HEAP_PASS_NO_SELF_MARK = '1'
+} else {
+    [Environment]::SetEnvironmentVariable('VICTORY_HEAP_PASS_NO_SELF_MARK', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('VICTORY_MAPPING_RANGES', $null, 'Process')
+}
+
+# Clear any CGBJ/three-adaptation flags from previous reference profile
+[Environment]::SetEnvironmentVariable('VICTORY_BIND_CACHE', $null, 'Process')
+[Environment]::SetEnvironmentVariable('VICTORY_INDIRECT_RECOVER', $null, 'Process')
+[Environment]::SetEnvironmentVariable('VICTORY_PIPELINE_WORKERS', $null, 'Process')
+[Environment]::SetEnvironmentVariable('VICTORY_PIPELINE_LOWEST', $null, 'Process')
 
 $gameDir = Join-Path $root 'GTA6.Xbox.v1.0.2.1-CYBERLEEK'
 $game = Join-Path $gameDir 'game_scarlett_master.exe'
@@ -20,12 +26,7 @@ $env:VICTORY_DXIL = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64
 $env:VICTORY_DISPLAY_MODE = '1280x720'
 $env:VICTORY_LOG = 'info'
 $env:VICTORY_PIPELINE_SMALL_FIRST = '1'
-# O checkpoint jogavel nao tinha este override. Teste somente com a opcao explicita.
-if ($ExperimentalBakeBudget) {
-    $env:VICTORY_BAKE_TEXTURES_MS = '0'
-} else {
-    [Environment]::SetEnvironmentVariable('VICTORY_BAKE_TEXTURES_MS', $null, 'Process')
-}
+$env:VICTORY_BAKE_TEXTURES_MS = '0'
 $env:VICTORY_TEXTURE_DROP_MIPS = '1'
 $env:VICTORY_SMALL_TEXTURE_KB = '0'
 $env:VICTORY_QUEUE2 = '1'
@@ -71,7 +72,6 @@ public static class VictoryWindow
                 return false;
             var borderWidth = (outer.Right - outer.Left) - (client.Right - client.Left);
             var borderHeight = (outer.Bottom - outer.Top) - (client.Bottom - client.Top);
-            // Keep the position and Z-order, and verify the drawable area.
             if (!SetWindowPos(window, IntPtr.Zero, 0, 0, width + borderWidth,
                 height + borderHeight, 0x0002 | 0x0004 | 0x0010))
                 return false;
@@ -93,30 +93,24 @@ $process = Start-Process -FilePath $exe -WorkingDirectory $gameDir -PassThru -Wi
     -RedirectStandardOutput (Join-Path $logs 'stdout.txt') `
     -RedirectStandardError (Join-Path $logs 'stderr.txt')
 
-if ($ExperimentalBufferPass) {
-    $metadata = @{
-        experiment = 'reference-cgbj-three'
-        bind_cache = '1'
-        indirect_recover = '1'
-        pipeline_workers = '4'
-        pipeline_lowest = '1'
-        binary = $exe
-        sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
-        process_id = $process.Id
-        mapping_ranges = '1'
-        heap_pass_no_self_mark = '1'
-        bake_textures_ms = 'default (unset)'
-        usage_interval_seconds = 5
-    }
-    $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $logs 'experiment.json')
-    $sampler = Join-Path $PSScriptRoot 'Measure-LocalUsage.ps1'
-    $shell = (Get-Process -Id $PID).Path
-    Start-Process -FilePath $shell -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-File', ('"' + $sampler + '"'),
-        '-TargetProcessId', $process.Id, '-OutputPath',
-        ('"' + (Join-Path $logs 'usage.jsonl') + '"'), '-IntervalSeconds', '5'
-    ) -RedirectStandardError (Join-Path $logs 'usage-errors.txt') | Out-Null
+$metadata = @{
+    experiment = 'reference-ede4cbb-buffer-pass'
+    binary = $exe
+    sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+    process_id = $process.Id
+    mapping_ranges = '1'
+    heap_pass_no_self_mark = '1'
+    bake_textures_ms = '0'
+    usage_interval_seconds = 5
 }
+$metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $logs 'experiment.json')
+$sampler = Join-Path $PSScriptRoot 'Measure-LocalUsage.ps1'
+$shell = (Get-Process -Id $PID).Path
+Start-Process -FilePath $shell -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-File', ('"' + $sampler + '"'),
+    '-TargetProcessId', $process.Id, '-OutputPath',
+    ('"' + (Join-Path $logs 'usage.jsonl') + '"'), '-IntervalSeconds', '5'
+) -RedirectStandardError (Join-Path $logs 'usage-errors.txt') | Out-Null
 
 $deadline = [DateTime]::UtcNow.AddSeconds(60)
 do {

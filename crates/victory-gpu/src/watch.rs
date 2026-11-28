@@ -23,6 +23,7 @@
 //! [`MANY_VIEWS`] views). A
 //! system call writing into a guarded block fails (none is known to).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
@@ -59,6 +60,94 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+/// Thread-local batch of write-watch ranges to reduce kernel calls.
+/// Accumulates ranges and flushes when batch size or time threshold reached.
+thread_local! {
+    static WRITE_BATCH: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
+    static BATCH_TIMER: RefCell<std::time::Instant> = RefCell::new(std::time::Instant::now());
+}
+
+/// Maximum ranges to batch before forced flush.
+const BATCH_MAX_RANGES: usize = 32;
+/// Maximum time (ms) to hold a batch before flush.
+const BATCH_MAX_MS: u64 = 2;
+
+/// Flushes the thread-local write-watch batch to the kernel.
+fn flush_write_batch() {
+    WRITE_BATCH.with(|batch| {
+        let mut ranges = batch.borrow_mut();
+        if ranges.is_empty() {
+            return;
+        }
+        // Merge overlapping/adjacent ranges
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges.drain(..) {
+            if let Some((_last_start, last_end)) = merged.last_mut() {
+                if start <= *last_end + (PAGE * 4) { // merge if close (4 pages = 256 KiB)
+                    *last_end = (*last_end).max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            } else {
+                merged.push((start, end));
+            }
+        }
+        // Submit merged ranges as single kernel calls where possible
+        for &(start, end) in &merged {
+            let _ = ask_kernel_range(start, end);
+        }
+        BATCH_TIMER.with(|t| *t.borrow_mut() = std::time::Instant::now());
+    });
+}
+
+/// Asks kernel for a single range, used by batch flusher.
+fn ask_kernel_range(first_page: usize, last_page: usize) -> bool {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let first = first_page * PAGE;
+    let _last = last_page * PAGE;
+    let mut count = (last_page - first_page) * PAGE / KERNEL_PAGE;
+    let found_len = j.found.len();
+    j.found.resize(count.max(found_len), 0);
+    let mut _granularity = 0;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let failed = unsafe {
+        windows_sys::Win32::System::Memory::GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            first as *const _,
+            (last_page - first_page) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut 0,
+        )
+    } != 0;
+    if failed {
+        return false;
+    }
+    let now = j.asked + 1;
+    j.asked = now;
+    for k in 0..count {
+        let page = j.found[k] / PAGE;
+        j.written.insert(page, now);
+    }
+    true
+}
+
+/// Enqueues a write-watch range for batched kernel submission.
+fn enqueue_write_batch(start: usize, end: usize) {
+    WRITE_BATCH.with(|batch| {
+        let mut ranges = batch.borrow_mut();
+        ranges.push((start / PAGE, end.div_ceil(PAGE)));
+        // Flush if batch full or time threshold exceeded
+        let should_flush = ranges.len() >= BATCH_MAX_RANGES
+            || BATCH_TIMER.with(|t| t.borrow().elapsed().as_millis() >= u128::from(BATCH_MAX_MS));
+        if should_flush {
+            drop(ranges);
+            flush_write_batch();
+        }
+    });
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -304,7 +393,6 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -379,22 +467,24 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             ));
         }
     }
+    // For regular write-watched memory: use existing ask_ahead/ask_once batching.
+    // The writes() function needs immediate results, so do kernel call directly.
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
+    let mut _granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // View memory the guards already hold was answered above (unless
     // `VICTORY_VIEW_ASK=1`): what reaches here is asked of the kernel.
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
-        GetWriteWatch(
+        windows_sys::Win32::System::Memory::GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
             (last - first) * PAGE,
             j.found.as_mut_ptr().cast(),
             &mut count,
-            &mut granularity,
+            &mut 0,
         )
     } != 0;
     #[cfg(feature = "diagnostics")]

@@ -194,12 +194,3 @@ Several contributors' own commits also say they were written with AI
 assistance (Claude Code, OpenAI Codex); commits in triippywhale's fork carry
 the author name "Claude". Commits co-authored by "OpenBot" (fork PRs 462 and
 685) are credited above to their human authors.
-
-### Three local adaptations from CGBJ
-
-Target/depth binding reuse, indirect oversized-record budget recovery and
-pipeline worker controls are adapted from brenofrancoa/fork-cgbj revision
-f4b48ad766ddbec1a1867022cd42f7645b0dd55e (GPL-3.0-or-later), retaining local
-scheduling defaults and opt-in switches. Source: draw.rs, descriptor.rs,
-indirect.rs and pipeline/make.rs. Local tests and integration: AI assistance
-by OpenAI Codex, GPT-6. Upstream authorship remains credited by the fork history.
